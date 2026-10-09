@@ -147,6 +147,7 @@ void enterState(BotState newState) {
       _pendingGestureState    = STATE_HAPPY;
       _gesturePending         = true;
       _audioStartedForGesture = false;
+      _gestureSetTime         = millis();
       break;
 
     case STATE_SAD:
@@ -155,6 +156,7 @@ void enterState(BotState newState) {
       _pendingGestureState    = STATE_SAD;
       _gesturePending         = true;
       _audioStartedForGesture = false;
+      _gestureSetTime         = millis();
       break;
 
     case STATE_CURIOUS:
@@ -163,6 +165,7 @@ void enterState(BotState newState) {
       _pendingGestureState    = STATE_CURIOUS;
       _gesturePending         = true;
       _audioStartedForGesture = false;
+      _gestureSetTime         = millis();
       break;
 
     case STATE_ANGRY:
@@ -171,6 +174,7 @@ void enterState(BotState newState) {
       _pendingGestureState    = STATE_ANGRY;
       _gesturePending         = true;
       _audioStartedForGesture = false;
+      _gestureSetTime         = millis();
       break;
 
     case STATE_EXCITED:
@@ -179,6 +183,7 @@ void enterState(BotState newState) {
       _pendingGestureState    = STATE_EXCITED;
       _gesturePending         = true;
       _audioStartedForGesture = false;
+      _gestureSetTime         = millis();
       break;
 
     case STATE_NEUTRAL:
@@ -187,6 +192,7 @@ void enterState(BotState newState) {
       _pendingGestureState    = STATE_NEUTRAL;
       _gesturePending         = true;
       _audioStartedForGesture = false;
+      _gestureSetTime         = millis();
       break;
   }
 }
@@ -541,7 +547,7 @@ void loop() {
 
   // Per-state tick
   switch (currentState) {
-    case STATE_IDLE:      tickIdle();          break;
+    case STATE_IDLE:      if (!audioPlayer.isPlaying()) tickIdle(); break;
     case STATE_LISTENING: tickListening();     break;
     case STATE_THINKING:  tickThinking();      break;
     case STATE_HAPPY:

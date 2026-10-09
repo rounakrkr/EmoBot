@@ -1,163 +1,322 @@
 /**
- * Emo V2 — Audio Player
+ * Emo V2 — Audio Player  (download-then-play)
  *
- * Raw PCM (22050 Hz, 16-bit, mono) from backend
- * → 16 KB lock-free ring buffer
- * → Pre-buffer ~185ms before playback starts (absorbs jitter)
- * → A2DP callback: 2× sample duplication → 44100 Hz stereo
- * → Bluetooth speaker ("Mini boost 4")
+ * Why: WiFi RX and A2DP TX fight over the single ESP32 radio. Streaming live
+ * caused 3-9 s WiFi stalls (=> audible stutter / WS disconnects).
+ *
+ * Flow per reply:
+ *   audio_start  -> open /clip.pcm in LittleFS, SUSPEND the A2DP stream
+ *                   (radio is free, WiFi gets its full ~80 KB/s)
+ *   PCM chunks   -> buffered (4 KB) and written to flash
+ *   audio_end    -> close file, resume A2DP (CHECK_SRC_RDY -> START)
+ *   playback     -> reader task: flash -> small ring -> A2DP callback
+ *                   (2x upsample + mono->stereo). No WiFi traffic needed,
+ *                   and servo delay()s in loop() can't starve the audio.
+ *
+ * Needs: Partition Scheme "Huge APP (3MB No OTA / 1MB SPIFFS)" (LittleFS).
+ * Input format: raw PCM 22050 Hz, 16-bit, mono.
  */
 #pragma once
 
 #include "BluetoothA2DPSource.h"
+#include "esp_a2dp_api.h"
+#include <LittleFS.h>
 #include "../config.h"
 
-// ── Ring buffer ───────────────────────────────────────────
-// 16 KB = 8192 int16 samples = ~371 ms at 22050 Hz
-#define RING_BYTES    (16 * 1024)
-#define RING_SAMPLES  (RING_BYTES / 2)
+// ── Tunables ─────────────────────────────────────────────
+#define CLIP_PATH              "/clip.pcm"
+#define MAX_CLIP_BYTES         (600UL * 1024UL)   // ~13.6 s, fits 1 MB LittleFS
+#define RING_SAMPLES           4096               // 8 KB ring (~186 ms)
+#define PREBUFFER_SAMPLES      1536               // ~70 ms before first sound
+#define WBUF_BYTES             4096               // flash write buffer
+#define DOWNLOAD_TIMEOUT_MS    5000               // no chunk for this long -> give up
+#define RESUME_STEP_TIMEOUT_MS 2500
+#define RESUME_MAX_TRIES       3
 
-// Pre-buffer: wait until this many samples are in ring before starting playback.
-// ~185ms cushion — absorbs network jitter regardless of root cause.
-#define PREBUFFER_SAMPLES  (RING_SAMPLES / 4)
+enum ApState { AP_IDLE, AP_DOWNLOADING, AP_RESUMING, AP_PLAYING };
 
-static int16_t  _ring[RING_SAMPLES];
-static volatile int      _ringHead = 0;   // written by main task (WebSocket)
-static volatile int      _ringTail = 0;   // read by A2DP callback on Core 0
-static volatile bool     _streaming  = false;  // true while chunks arriving
-static volatile bool     _streamDone = false;  // true after audio_end received
-static volatile bool     _drainDone  = false;  // signals loop() to print "done"
-static volatile bool     _playbackStarted = false;  // false until pre-buffer threshold met
-static volatile uint32_t _totalSamplesReceived = 0;
-static bool              _lastConnected = false;
+static volatile ApState  _apState = AP_IDLE;
+
+// ── Ring (single producer: reader task, single consumer: A2DP callback)
+static int16_t           _ring[RING_SAMPLES];
+static volatile int      _ringHead = 0;
+static volatile int      _ringTail = 0;
+static volatile bool     _playActive      = false;  // callback may consume ring
+static volatile bool     _playbackStarted = false;  // pre-buffer gate passed
+static volatile bool     _fileEof         = false;  // reader hit end of file
+static volatile bool     _readerActive    = false;
+static volatile bool     _drainDone       = false;
+
+static volatile esp_a2d_audio_state_t _btState = ESP_A2D_AUDIO_STATE_STOPPED;
+
+// ── Download / resume bookkeeping (main task only)
+static uint8_t   _wbuf[WBUF_BYTES];
+static size_t    _wbufLen      = 0;
+static File      _wfile, _rfile;
+static uint32_t  _clipBytes    = 0;
+static bool      _btSuspended  = false;
+static uint32_t  _lastChunkMs  = 0;
+static uint32_t  _stepMs       = 0;
+static uint32_t  _playStartMs  = 0;
+static uint8_t   _resumeStep   = 0;
+static uint8_t   _resumeTries  = 0;
+static bool      _lastConnected = false;
 
 static BluetoothA2DPSource _a2dp;
 
-// ── Helpers ──────────────────────────────────────────────
-static inline int _ringAvail() {
-    return (_ringHead - _ringTail + RING_SAMPLES) % RING_SAMPLES;
-}
-static inline int _ringSpace() {
-    return RING_SAMPLES - 1 - _ringAvail();
-}
+static inline int _ringAvail() { return (_ringHead - _ringTail + RING_SAMPLES) % RING_SAMPLES; }
+static inline int _ringSpace() { return RING_SAMPLES - 1 - _ringAvail(); }
 
-// ── A2DP Callback — runs on Core 0 (BT task) ─────────────
-// Each input sample → 2 A2DP stereo frames (22050 → 44100 Hz)
-// Mono → stereo: channel1 = channel2 = sample
+static void _onA2dpAudioState(esp_a2d_audio_state_t state, void*) { _btState = state; }
+
+// ── A2DP data callback — BT task (Core 0) ────────────────
+// Each input sample -> 2 stereo frames (22050 -> 44100 Hz, mono -> stereo)
 static int32_t _a2dpCallback(Frame* frames, int32_t count) {
+    if (!_playActive) {                       // nothing to play: silence
+        for (int i = 0; i < count; i++) { frames[i].channel1 = 0; frames[i].channel2 = 0; }
+        return count;
+    }
 
-    // Pre-buffer gate: output silence until enough data is buffered
-    if (!_playbackStarted) {
-        if (_ringAvail() >= PREBUFFER_SAMPLES || _streamDone) {
-            _playbackStarted = true;  // Cushion ready — start playing!
+    if (!_playbackStarted) {                  // pre-buffer gate
+        if (_ringAvail() >= PREBUFFER_SAMPLES || _fileEof) {
+            _playbackStarted = true;
         } else {
-            for (int i = 0; i < count; i++) {
-                frames[i].channel1 = 0;
-                frames[i].channel2 = 0;
-            }
+            for (int i = 0; i < count; i++) { frames[i].channel1 = 0; frames[i].channel2 = 0; }
             return count;
         }
     }
 
     int filled = 0;
-
-    while (filled + 1 < count) {   // room for 2 stereo frames per sample
+    while (filled + 1 < count) {
         if (_ringAvail() == 0) {
-            if (_streamDone) {
+            if (_fileEof) {                   // file fully read AND ring drained
+                _playActive = false;
                 _drainDone  = true;
-                _streamDone = false;
             }
             break;
         }
         int16_t s = _ring[_ringTail];
         _ringTail = (_ringTail + 1) % RING_SAMPLES;
-
-        // 2× upsampling + mono→stereo
-        frames[filled].channel1 = s;
-        frames[filled].channel2 = s;
-        filled++;
-        frames[filled].channel1 = s;
-        frames[filled].channel2 = s;
-        filled++;
+        frames[filled].channel1 = s; frames[filled].channel2 = s; filled++;
+        frames[filled].channel1 = s; frames[filled].channel2 = s; filled++;
     }
-
-    // Pad with silence when no samples ready
-    for (int i = filled; i < count; i++) {
-        frames[i].channel1 = 0;
-        frames[i].channel2 = 0;
-    }
+    for (int i = filled; i < count; i++) { frames[i].channel1 = 0; frames[i].channel2 = 0; }
     return count;
+}
+
+// ── Reader task: flash -> ring ───────────────────────────
+static void _readerTask(void*) {
+    uint8_t tmp[512];
+    for (;;) {
+        if (_readerActive) {
+            int space = _ringSpace();
+            if (space >= 256) {
+                int n = _rfile.read(tmp, 512);
+                if (n > 1) {
+                    const int16_t* s = (const int16_t*)tmp;
+                    int h = _ringHead;
+                    for (int i = 0; i < n / 2; i++) { _ring[h] = s[i]; h = (h + 1) % RING_SAMPLES; }
+                    __sync_synchronize();
+                    _ringHead = h;
+                    continue;
+                }
+                _fileEof      = true;         // EOF (or read error)
+                _readerActive = false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(4));
+    }
 }
 
 // ════════════════════════════════════════════════════════
 class AudioPlayerClass {
 public:
-
     // Call in setup() — BEFORE WiFi for stable coexistence
     void begin() {
+        if (!LittleFS.begin(true)) {          // true = format on first use
+            Serial.println("[AUDIO] ✗ LittleFS mount failed — check Partition Scheme!");
+        } else {
+            Serial.printf("[AUDIO] LittleFS ok: %u / %u bytes free\n",
+                          (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()),
+                          (unsigned)LittleFS.totalBytes());
+            LittleFS.remove(CLIP_PATH);
+        }
+        xTaskCreatePinnedToCore(_readerTask, "audioRd", 4096, nullptr, 2, nullptr, 1);
+        _a2dp.set_on_audio_state_changed(_onA2dpAudioState);
         _a2dp.start(BT_SPEAKER_NAME, _a2dpCallback);
         Serial.println("[AUDIO] A2DP started. Searching for '" BT_SPEAKER_NAME "'...");
     }
 
-    // ── backend sends {"type":"audio_start"} ─────────────
+    // ── {"type":"audio_start"} ───────────────────────────
     void onAudioStart() {
-        _ringHead   = 0;
-        _ringTail   = 0;
-        _streamDone = false;
-        _drainDone  = false;
-        _playbackStarted = false;   // Wait for pre-buffer threshold
-        _streaming  = true;
-        _totalSamplesReceived = 0;
-        Serial.println("[AUDIO] ▶ Stream started (pre-buffering...)");
-    }
-
-    // ── backend sends binary chunk (raw PCM) ─────────────
-    void onPCMChunk(const uint8_t* data, size_t len) {
-        if (!_streaming) return;
-
-        int numSamples = len / 2;
-        const int16_t* samples = (const int16_t*)data;
-
-        int space = _ringSpace();
-        int toCopy = min(numSamples, space);
-
-        for (int i = 0; i < toCopy; i++) {
-            _ring[_ringHead] = samples[i];
-            _ringHead = (_ringHead + 1) % RING_SAMPLES;
+        _stopAll();                                   // abort anything in flight
+        LittleFS.remove(CLIP_PATH);
+        _wfile = LittleFS.open(CLIP_PATH, FILE_WRITE);
+        if (!_wfile) {
+            Serial.println("[AUDIO] ✗ Cannot open clip file — dropping this reply's audio");
+            return;                                   // stay IDLE; chunks ignored
         }
+        _wbufLen = 0; _clipBytes = 0;
+        _lastChunkMs = millis();
+        _apState = AP_DOWNLOADING;
 
-        _totalSamplesReceived += toCopy;
+        if (_a2dp.is_connected() && !_btSuspended) {
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);   // free the radio
+            _btSuspended = true;
+        }
+        Serial.println("[AUDIO] ⬇ Downloading clip (A2DP suspended)...");
     }
 
-    // ── backend sends {"type":"audio_end"} ───────────────
+    // ── binary chunk (raw PCM) ───────────────────────────
+    void onPCMChunk(const uint8_t* data, size_t len) {
+        if (_apState != AP_DOWNLOADING) return;
+        _lastChunkMs = millis();
+        while (len > 0) {
+            if (_clipBytes + _wbufLen >= MAX_CLIP_BYTES) return;     // cap: drop the rest
+            size_t n = min(len, (size_t)(WBUF_BYTES - _wbufLen));
+            memcpy(_wbuf + _wbufLen, data, n);
+            _wbufLen += n; data += n; len -= n;
+            if (_wbufLen == WBUF_BYTES) _flushWrite();
+        }
+    }
+
+    // ── {"type":"audio_end"} ─────────────────────────────
     void onAudioEnd() {
-        _streaming  = false;
-        _streamDone = true;   // A2DP callback will set _drainDone when ring drains
-        Serial.printf("[AUDIO] Stream end — %u samples total (~%d ms)\n",
-                      _totalSamplesReceived,
-                      (int)(_totalSamplesReceived * 1000UL / 22050UL));
+        if (_apState != AP_DOWNLOADING) return;
+        _finishDownload();
     }
 
+    // Call every loop()
     void loop() {
-        // Monitor BT connection state changes
+        uint32_t now = millis();
+
         bool connected = _a2dp.is_connected();
         if (connected != _lastConnected) {
             _lastConnected = connected;
-            if (connected) {
-                Serial.printf("\n[AUDIO] ✓ Bluetooth Speaker '%s' CONNECTED!\n", BT_SPEAKER_NAME);
-            } else {
-                Serial.printf("\n[AUDIO] ✗ Bluetooth Speaker '%s' DISCONNECTED!\n", BT_SPEAKER_NAME);
-            }
+            Serial.printf("\n[AUDIO] %s Bluetooth Speaker '%s' %s!\n",
+                          connected ? "✓" : "✗", BT_SPEAKER_NAME,
+                          connected ? "CONNECTED" : "DISCONNECTED");
+            if (!connected) _btSuspended = false;     // stream state is gone with the link
         }
 
-        if (_drainDone) {
-            _drainDone = false;
-            Serial.println("[AUDIO] ■ Playback done");
+        switch (_apState) {
+        case AP_DOWNLOADING:
+            if (now - _lastChunkMs > DOWNLOAD_TIMEOUT_MS) {
+                Serial.println("[AUDIO] ⚠ Download timeout — playing what we have");
+                _finishDownload();
+            }
+            break;
+
+        case AP_RESUMING:
+            _stepResume(now);
+            break;
+
+        case AP_PLAYING:
+            if (_drainDone) {
+                _drainDone = false;
+                _endPlayback();
+                Serial.println("[AUDIO] ■ Playback done");
+            } else if (now - _playStartMs > (_clipBytes / 44UL) + 4000UL || !connected) {
+                Serial.println("[AUDIO] ⚠ Playback watchdog — aborting");
+                _endPlayback();
+            }
+            break;
+
+        default: break;
         }
     }
 
-    bool isPlaying()   { return _streaming || _streamDone || (_ringAvail() > 0); }
+    // True for the whole reply: download + resume + playback
+    bool isPlaying()   { return _apState != AP_IDLE; }
     bool isConnected() { return _a2dp.is_connected(); }
+
+private:
+    void _flushWrite() {
+        if (_wbufLen == 0) return;
+        size_t w = _wfile.write(_wbuf, _wbufLen);
+        if (w != _wbufLen) Serial.printf("[AUDIO] ⚠ Flash write short: %u/%u\n", (unsigned)w, (unsigned)_wbufLen);
+        _clipBytes += w;
+        _wbufLen = 0;
+    }
+
+    void _finishDownload() {
+        _flushWrite();
+        _wfile.close();
+        Serial.printf("[AUDIO] ⬇ Clip saved: %u bytes (~%u ms)\n",
+                      (unsigned)_clipBytes, (unsigned)(_clipBytes * 1000UL / 44100UL));
+        _resumeStep = 0; _resumeTries = 0;
+        _apState = (_clipBytes >= 2) ? AP_RESUMING : AP_IDLE;
+        if (_apState == AP_IDLE && _btSuspended) {    // nothing to play: resume stream anyway
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            _btSuspended = false;
+        }
+    }
+
+    void _stepResume(uint32_t now) {
+        if (!_btSuspended) { _beginPlayback(); return; }
+        if (_resumeStep == 0) {
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+            _stepMs = now; _resumeStep = 1;
+        } else if (_resumeStep == 1) {
+            if (now - _stepMs >= 80) {
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+                _stepMs = now; _resumeStep = 2;
+            }
+        } else {
+            if (_btState == ESP_A2D_AUDIO_STATE_STARTED) {
+                _btSuspended = false;
+                Serial.println("[AUDIO] ▶ A2DP resumed");
+                _beginPlayback();
+            } else if (now - _stepMs > RESUME_STEP_TIMEOUT_MS) {
+                if (++_resumeTries < RESUME_MAX_TRIES) {
+                    Serial.printf("[AUDIO] ⚠ Resume retry %u...\n", _resumeTries);
+                    _resumeStep = 0;
+                } else {
+                    Serial.println("[AUDIO] ✗ A2DP did not resume — dropping clip");
+                    _btSuspended = false;
+                    _apState = AP_IDLE;
+                }
+            }
+        }
+    }
+
+    void _beginPlayback() {
+        if (!_a2dp.is_connected()) {
+            Serial.println("[AUDIO] Speaker not connected — dropping clip");
+            _apState = AP_IDLE;
+            return;
+        }
+        _rfile = LittleFS.open(CLIP_PATH, FILE_READ);
+        if (!_rfile) {
+            Serial.println("[AUDIO] ✗ Cannot open clip for playback");
+            _apState = AP_IDLE;
+            return;
+        }
+        _ringHead = 0; _ringTail = 0;
+        _playbackStarted = false; _fileEof = false; _drainDone = false;
+        _playStartMs = millis();
+        _apState = AP_PLAYING;
+        _playActive   = true;                         // enable consumer first...
+        _readerActive = true;                         // ...then producer
+        Serial.println("[AUDIO] ▶ Playing from flash");
+    }
+
+    void _endPlayback() {
+        _playActive = false; _readerActive = false;
+        vTaskDelay(pdMS_TO_TICKS(10));                // let reader task leave _rfile
+        if (_rfile) _rfile.close();
+        _apState = AP_IDLE;
+    }
+
+    // Abort whatever is happening (new reply arrived, etc). A2DP suspend state is kept.
+    void _stopAll() {
+        _playActive = false; _readerActive = false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (_rfile) _rfile.close();
+        if (_wfile) _wfile.close();
+        _wbufLen = 0;
+        _apState = AP_IDLE;
+    }
 };
 
 AudioPlayerClass audioPlayer;

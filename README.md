@@ -96,7 +96,7 @@ uvicorn main:app --host 0.0.0.0 --port 8001
 1. Open `firmware/emo_v2/emo_v2.ino` in **Arduino IDE**.
 2. Copy `firmware/config.example.h` to `firmware/config.h` (git-ignored) and fill in your WiFi credentials and backend IP.
 3. Select board: **ESP32 Dev Module**.
-4. Set Partition Scheme: **Huge APP (3MB No OTA / 1MB SPIFFS)**.
+4. Set Partition Scheme: **Huge APP (3MB No OTA / 1MB SPIFFS)** (the 1 MB LittleFS area stores each reply's audio clip before playback).
 5. Click **Upload**.
 
 ---
