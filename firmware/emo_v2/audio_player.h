@@ -30,7 +30,7 @@
 #define PREBUFFER_SAMPLES      1536               // ~70 ms before first sound
 #define WBUF_BYTES             4096               // flash write buffer
 #define DOWNLOAD_TIMEOUT_MS    15000              // no chunk for this long -> give up
-#define AUDIO_SUSPEND_A2DP     1                  // 0 = keep A2DP streaming during download (A/B test)
+#define AUDIO_SUSPEND_A2DP     0                  // 0 = keep A2DP streaming during download (avoids suspend packet drop)
 #define AUDIO_DEBUG_TIMING     1                  // log chunk arrival / flash write timings
 #define RESUME_STEP_TIMEOUT_MS 2500
 #define RESUME_MAX_TRIES       3

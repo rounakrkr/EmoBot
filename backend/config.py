@@ -8,8 +8,8 @@ class Settings(BaseSettings):
 
     # LLM
     LLM_PROVIDER: str = "groq"
-    LLM_MODEL: str = "llama-3.1-8b-instant"
-    LLM_MAX_TOKENS: int = 150
+    LLM_MODEL: str = "openai/gpt-oss-20b"
+    LLM_MAX_TOKENS: int = 500
 
     # STT
     STT_PROVIDER: str = "groq"
