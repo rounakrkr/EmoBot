@@ -461,7 +461,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n[WiFi] ✓ Connected! IP: " + WiFi.localIP().toString());
     WiFi.setSleep(false);
-    esp_coex_preference_set(ESP_COEX_PREFER_BT);
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     Serial.printf("[MEM] Free heap after WiFi+BT: %u bytes | Min heap: %u bytes\n",
                   ESP.getFreeHeap(), ESP.getMinFreeHeap());
   } else {
