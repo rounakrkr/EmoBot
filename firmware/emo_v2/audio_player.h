@@ -29,7 +29,9 @@
 #define RING_SAMPLES           4096               // 8 KB ring (~186 ms)
 #define PREBUFFER_SAMPLES      1536               // ~70 ms before first sound
 #define WBUF_BYTES             4096               // flash write buffer
-#define DOWNLOAD_TIMEOUT_MS    5000               // no chunk for this long -> give up
+#define DOWNLOAD_TIMEOUT_MS    15000              // no chunk for this long -> give up
+#define AUDIO_SUSPEND_A2DP     1                  // 0 = keep A2DP streaming during download (A/B test)
+#define AUDIO_DEBUG_TIMING     1                  // log chunk arrival / flash write timings
 #define RESUME_STEP_TIMEOUT_MS 2500
 #define RESUME_MAX_TRIES       3
 
@@ -61,6 +63,9 @@ static uint32_t  _playStartMs  = 0;
 static uint8_t   _resumeStep   = 0;
 static uint8_t   _resumeTries  = 0;
 static bool      _lastConnected = false;
+static uint32_t  _dlStartMs    = 0;
+static uint16_t  _dlChunks     = 0;
+static int       _btStatePrinted = -1;
 
 static BluetoothA2DPSource _a2dp;
 
@@ -160,17 +165,25 @@ public:
         _lastChunkMs = millis();
         _apState = AP_DOWNLOADING;
 
+#if AUDIO_SUSPEND_A2DP
         if (_a2dp.is_connected() && !_btSuspended) {
             esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);   // free the radio
             _btSuspended = true;
         }
-        Serial.println("[AUDIO] ⬇ Downloading clip (A2DP suspended)...");
+#endif
+        _dlStartMs = millis(); _dlChunks = 0;
+        Serial.printf("[AUDIO] ⬇ Downloading clip (A2DP %s, bt_state=%d, heap=%u)\n",
+                      _btSuspended ? "suspended" : "NOT suspended", (int)_btState, (unsigned)ESP.getFreeHeap());
     }
 
     // ── binary chunk (raw PCM) ───────────────────────────
     void onPCMChunk(const uint8_t* data, size_t len) {
         if (_apState != AP_DOWNLOADING) return;
         _lastChunkMs = millis();
+#if AUDIO_DEBUG_TIMING
+        if (_dlChunks < 8) Serial.printf("[AUDIO]   chunk #%u @ +%u ms\n", _dlChunks + 1, (unsigned)(_lastChunkMs - _dlStartMs));
+#endif
+        _dlChunks++;
         while (len > 0) {
             if (_clipBytes + _wbufLen >= MAX_CLIP_BYTES) return;     // cap: drop the rest
             size_t n = min(len, (size_t)(WBUF_BYTES - _wbufLen));
@@ -178,6 +191,7 @@ public:
             _wbufLen += n; data += n; len -= n;
             if (_wbufLen == WBUF_BYTES) _flushWrite();
         }
+        _lastChunkMs = millis();      // a slow flash write must not count as "no data"
     }
 
     // ── {"type":"audio_end"} ─────────────────────────────
@@ -197,6 +211,11 @@ public:
                           connected ? "✓" : "✗", BT_SPEAKER_NAME,
                           connected ? "CONNECTED" : "DISCONNECTED");
             if (!connected) _btSuspended = false;     // stream state is gone with the link
+        }
+
+        if ((int)_btState != _btStatePrinted) {
+            _btStatePrinted = (int)_btState;
+            Serial.printf("[AUDIO] bt_state -> %d (0=remote_suspend 1=stopped 2=started)\n", _btStatePrinted);
         }
 
         switch (_apState) {
@@ -233,7 +252,12 @@ public:
 private:
     void _flushWrite() {
         if (_wbufLen == 0) return;
+        uint32_t t0 = millis();
         size_t w = _wfile.write(_wbuf, _wbufLen);
+#if AUDIO_DEBUG_TIMING
+        uint32_t dt = millis() - t0;
+        if (dt > 60) Serial.printf("[AUDIO]   ⚠ flash write took %u ms (total so far %u B)\n", (unsigned)dt, (unsigned)(_clipBytes + w));
+#endif
         if (w != _wbufLen) Serial.printf("[AUDIO] ⚠ Flash write short: %u/%u\n", (unsigned)w, (unsigned)_wbufLen);
         _clipBytes += w;
         _wbufLen = 0;
@@ -242,8 +266,9 @@ private:
     void _finishDownload() {
         _flushWrite();
         _wfile.close();
-        Serial.printf("[AUDIO] ⬇ Clip saved: %u bytes (~%u ms)\n",
-                      (unsigned)_clipBytes, (unsigned)(_clipBytes * 1000UL / 44100UL));
+        Serial.printf("[AUDIO] ⬇ Clip saved: %u bytes (~%u ms audio) in %u ms, %u chunks\n",
+                      (unsigned)_clipBytes, (unsigned)(_clipBytes * 1000UL / 44100UL),
+                      (unsigned)(millis() - _dlStartMs), (unsigned)_dlChunks);
         _resumeStep = 0; _resumeTries = 0;
         _apState = (_clipBytes >= 2) ? AP_RESUMING : AP_IDLE;
         if (_apState == AP_IDLE && _btSuspended) {    // nothing to play: resume stream anyway
