@@ -50,7 +50,7 @@ EmoBot/
 │   └── requirements.txt      # Backend Python dependencies
 │
 ├── firmware/                 # ESP32 Firmware (PlatformIO / Arduino IDE)
-│   ├── config.h              # Central hardware & network configuration
+│   ├── config.example.h      # Config template (copy to config.h — git-ignored)
 │   └── emo_v2/
 │       ├── emo_v2.ino        # Main sketch & state machine
 │       ├── audio_player.h    # A2DP player with prebuffering & ring buffer
@@ -94,7 +94,7 @@ uvicorn main:app --host 0.0.0.0 --port 8001
 
 ### 2. ESP32 Firmware Upload
 1. Open `firmware/emo_v2/emo_v2.ino` in **Arduino IDE**.
-2. Update `firmware/config.h` with your WiFi credentials and backend IP.
+2. Copy `firmware/config.example.h` to `firmware/config.h` (git-ignored) and fill in your WiFi credentials and backend IP.
 3. Select board: **ESP32 Dev Module**.
 4. Set Partition Scheme: **Huge APP (3MB No OTA / 1MB SPIFFS)**.
 5. Click **Upload**.

@@ -10,6 +10,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+from config import settings
+
 logger = logging.getLogger("emo.session")
 
 
@@ -18,7 +20,7 @@ class Session:
     device_id: str
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
-    short_term: deque = field(default_factory=lambda: deque(maxlen=5))
+    short_term: deque = field(default_factory=lambda: deque(maxlen=settings.SLIDING_WINDOW_SIZE))
     current_emotion: str = "neutral"
     state: str = "idle"   # idle | listening | thinking | speaking
 

@@ -98,9 +98,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 text = msg.get("text", "").strip()
                 if text:
                     logger.info(f"💬 Text input: \"{text}\"")
+                    # Never await a turn here: blocking the receive loop would
+                    # starve pings/pongs and make the ESP32 drop the connection.
                     if current_turn_task and not current_turn_task.done():
-                        logger.warning("Turn already in progress — waiting for completion")
-                        await current_turn_task
+                        logger.warning("Turn already in progress — ignoring new text input")
+                        continue
 
                     current_turn_task = asyncio.create_task(
                         pipeline.run_text(websocket, session, text, ws_lock=ws_lock)
@@ -110,6 +112,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "audio":
                 audio_b64 = msg.get("data", "")
                 if audio_b64:
+                    if current_turn_task and not current_turn_task.done():
+                        logger.warning("Turn already in progress — ignoring new audio")
+                        continue
                     import base64
                     audio_bytes = base64.b64decode(audio_b64)
                     current_turn_task = asyncio.create_task(

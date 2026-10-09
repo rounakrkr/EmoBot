@@ -220,3 +220,6 @@ emo_env/
 !.env.dummy
 *.log
 
+
+# Local secrets / credentials
+firmware/config.h

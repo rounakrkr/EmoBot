@@ -2,7 +2,7 @@
  * WiFi + Bluetooth A2DP Coexistence Test
  * 
  * Verifies if this ESP32 can connect to both:
- * 1. WiFi (RounakKR)
+ * 1. WiFi (WIFI_SSID from config.h)
  * 2. BT Speaker (Mini boost 4)
  * 
  * And prints free heap every 2 seconds.
@@ -12,8 +12,7 @@
 #include "BluetoothA2DPSource.h"
 #include <math.h>
 
-#define WIFI_SSID     "RounakKR"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#include "../../firmware/config.h"   // WIFI_SSID / WIFI_PASSWORD (copy config.example.h -> config.h)
 #define BT_NAME       "Mini boost 4"
 
 BluetoothA2DPSource a2dp;

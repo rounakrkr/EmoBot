@@ -20,8 +20,7 @@ class Settings(BaseSettings):
     TTS_VOICE: str = "en-US-AnaNeural"
 
     # Memory
-    MEMORY_SHORT_TERM_WINDOW: int = 5
-    MEMORY_LONG_TERM_RETRIEVE_COUNT: int = 3
+    SLIDING_WINDOW_SIZE: int = 5   # number of recent turns kept as context
     MEMORY_PERSIST_ACROSS_SESSIONS: bool = True
 
     # Server
